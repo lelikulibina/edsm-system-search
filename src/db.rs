@@ -175,6 +175,18 @@ mod tests {
     }
 
     #[test]
+    fn database_initialization_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_database(&conn).unwrap();
+        initialize_database(&conn).unwrap();
+        upsert_system(&conn, &sample(7, "Lave", 3.0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM systems_rtree", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn rtree_tracks_insert_update_and_delete() {
         let conn = Connection::open_in_memory().unwrap();
         initialize_database(&conn).unwrap();
