@@ -42,7 +42,7 @@ pub fn configure_connection(conn: &Connection) -> Result<(), DbError> {
         "PRAGMA foreign_keys = ON;
          PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
-         PRAGMA cache_size = -16384;
+         PRAGMA cache_size = -8192;
          PRAGMA temp_store = MEMORY;",
     )?;
     Ok(())
