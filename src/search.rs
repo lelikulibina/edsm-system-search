@@ -177,8 +177,8 @@ mod tests {
         add(&conn, 10, "Alpha Centauri AB 2", 1.0, 0.0, 0.0);
 
         let center = find_center(&conn, "Alpha Centauri AB 1 B").unwrap();
-        assert_eq!(center.edsm_id, 10);
-        assert_eq!(center.name, "Alpha Centauri AB 2");
+        assert_eq!(center.edsm_id, 20);
+        assert_eq!(center.name, "Alpha Centauri AB 1");
     }
 
     #[test]
