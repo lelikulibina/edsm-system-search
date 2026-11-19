@@ -8,6 +8,8 @@ use axum::{Json, Router};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio::task;
 use tower_http::trace::TraceLayer;
 
@@ -18,6 +20,17 @@ use crate::search::{SearchError, search_radius};
 pub struct AppState {
     pub database_path: PathBuf,
     pub max_radius: f64,
+    db_slots: Arc<Semaphore>,
+}
+
+impl AppState {
+    pub fn new(database_path: PathBuf, max_radius: f64) -> Self {
+        Self {
+            database_path,
+            max_radius,
+            db_slots: Arc::new(Semaphore::new(8)),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,10 +93,16 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
+    let permit = state.db_slots.clone().acquire_owned().await.map_err(|e| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "database_unavailable",
+        message: e.to_string(),
+    })?;
     let path = state.database_path;
     task::spawn_blocking(move || -> Result<(), String> {
+        let _permit = permit;
         let conn = open_database(path).map_err(|e| e.to_string())?;
-        let _: i64 = conn.query_row("SELECT 1", [], |row| row.get(0)).map_err(|e| e.to_string())?;
+        let _: i64 = conn.query_row("SELECT count(*) FROM systems", [], |row| row.get(0)).map_err(|e| e.to_string())?;
         Ok(())
     })
     .await
@@ -117,10 +136,16 @@ async fn search(
         });
     }
 
+    let permit = state.db_slots.clone().acquire_owned().await.map_err(|e| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "database_unavailable",
+        message: e.to_string(),
+    })?;
     let path = state.database_path;
     let center = query.center;
     let radius = query.radius;
     let result = task::spawn_blocking(move || {
+        let _permit = permit;
         let conn: Connection = open_database(path)?;
         search_radius(&conn, &center, radius)
     })
@@ -158,7 +183,7 @@ mod tests {
         }).unwrap();
         drop(conn);
 
-        let app = router(AppState { database_path: db_path, max_radius: 10.0 });
+        let app = router(AppState::new(db_path, 10.0));
         let response = app.oneshot(
             axum::http::Request::builder()
                 .uri("/search?center=Sol&radius=2")
@@ -175,10 +200,7 @@ mod tests {
     #[tokio::test]
     async fn search_endpoint_rejects_radius_above_limit() {
         let dir = tempdir().unwrap();
-        let app = router(AppState {
-            database_path: dir.path().join("missing.db"),
-            max_radius: 10.0,
-        });
+        let app = router(AppState::new(dir.path().join("missing.db"), 10.0));
         let response = app.oneshot(
             axum::http::Request::builder()
                 .uri("/search?center=Sol&radius=11")
