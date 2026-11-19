@@ -40,7 +40,6 @@ pub fn configure_connection(conn: &Connection) -> Result<(), DbError> {
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
-         PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA cache_size = -8192;
          PRAGMA temp_store = MEMORY;",
@@ -49,6 +48,7 @@ pub fn configure_connection(conn: &Connection) -> Result<(), DbError> {
 }
 
 pub fn initialize_database(conn: &Connection) -> Result<(), DbError> {
+    let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
     let schema_version: i64 =
         conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if schema_version >= 1 {
