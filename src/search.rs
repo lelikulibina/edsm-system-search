@@ -60,6 +60,14 @@ pub fn find_center(conn: &Connection, requested: &str) -> Result<System, SearchE
     }
 
     loop {
+        let Some((prefix, _)) = candidate.rsplit_once(' ') else {
+            break;
+        };
+        candidate = prefix.trim_end().to_owned();
+        if candidate.is_empty() {
+            break;
+        }
+
         let pattern = format!("{}%", escape_like(&candidate));
         if let Some(system) = conn.query_row(
             "SELECT edsm_id, id64, name, x, y, z, updated_at
@@ -69,14 +77,6 @@ pub fn find_center(conn: &Connection, requested: &str) -> Result<System, SearchE
             system_from_row,
         ).optional()? {
             return Ok(system);
-        }
-
-        let Some((prefix, _)) = candidate.rsplit_once(' ') else {
-            break;
-        };
-        candidate = prefix.trim_end().to_owned();
-        if candidate.is_empty() {
-            break;
         }
     }
 
@@ -179,6 +179,17 @@ mod tests {
         let center = find_center(&conn, "Alpha Centauri AB 1 B").unwrap();
         assert_eq!(center.edsm_id, 20);
         assert_eq!(center.name, "Alpha Centauri AB 1");
+    }
+
+    #[test]
+    fn single_token_name_does_not_fuzzy_match_longer_names() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_database(&conn).unwrap();
+        add(&conn, 1, "Solaria", 0.0, 0.0, 0.0);
+        assert!(matches!(
+            find_center(&conn, "Sol"),
+            Err(SearchError::CenterNotFound)
+        ));
     }
 
     #[test]
