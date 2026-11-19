@@ -72,10 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let listener = tokio::net::TcpListener::bind(bind).await?;
             tracing::info!(%bind, %max_radius, "HTTP server listening");
-            axum::serve(listener, router(AppState {
-                database_path: db,
-                max_radius,
-            }))
+            axum::serve(listener, router(AppState::new(db, max_radius)))
             .with_graceful_shutdown(shutdown_signal())
             .await?;
         }
