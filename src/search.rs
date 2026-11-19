@@ -59,10 +59,7 @@ pub fn find_center(conn: &Connection, requested: &str) -> Result<System, SearchE
         return Ok(system);
     }
 
-    loop {
-        let Some((prefix, _)) = candidate.rsplit_once(' ') else {
-            break;
-        };
+    while let Some((prefix, _)) = candidate.rsplit_once(' ') {
         candidate = prefix.trim_end().to_owned();
         if candidate.is_empty() {
             break;
