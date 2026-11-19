@@ -49,8 +49,15 @@ pub fn configure_connection(conn: &Connection) -> Result<(), DbError> {
 }
 
 pub fn initialize_database(conn: &Connection) -> Result<(), DbError> {
+    let schema_version: i64 =
+        conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if schema_version >= 1 {
+        return Ok(());
+    }
+
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS systems (
+        "BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS systems (
             edsm_id INTEGER PRIMARY KEY,
             id64 INTEGER,
             name TEXT NOT NULL,
@@ -90,7 +97,10 @@ pub fn initialize_database(conn: &Connection) -> Result<(), DbError> {
 
         CREATE TRIGGER systems_ad AFTER DELETE ON systems BEGIN
             DELETE FROM systems_rtree WHERE edsm_id = old.edsm_id;
-        END;",
+        END;
+
+        PRAGMA user_version = 1;
+        COMMIT;",
     )?;
     Ok(())
 }
