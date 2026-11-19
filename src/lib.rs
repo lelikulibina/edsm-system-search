@@ -1,4 +1,6 @@
+pub mod api;
 pub mod db;
+pub mod importer;
 pub mod search;
 
 pub use db::{DbError, System, open_database, initialize_database, upsert_system};
