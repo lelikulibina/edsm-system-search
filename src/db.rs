@@ -73,17 +73,22 @@ pub fn initialize_database(conn: &Connection) -> Result<(), DbError> {
             min_z, max_z
         );
 
-        CREATE TRIGGER IF NOT EXISTS systems_ai AFTER INSERT ON systems BEGIN
-            INSERT OR REPLACE INTO systems_rtree
+        DROP TRIGGER IF EXISTS systems_ai;
+        DROP TRIGGER IF EXISTS systems_au;
+        DROP TRIGGER IF EXISTS systems_ad;
+
+        CREATE TRIGGER systems_ai AFTER INSERT ON systems BEGIN
+            INSERT INTO systems_rtree
             VALUES (new.edsm_id, new.x, new.x, new.y, new.y, new.z, new.z);
         END;
 
-        CREATE TRIGGER IF NOT EXISTS systems_au AFTER UPDATE OF x, y, z ON systems BEGIN
-            INSERT OR REPLACE INTO systems_rtree
+        CREATE TRIGGER systems_au AFTER UPDATE OF x, y, z ON systems BEGIN
+            DELETE FROM systems_rtree WHERE edsm_id = old.edsm_id;
+            INSERT INTO systems_rtree
             VALUES (new.edsm_id, new.x, new.x, new.y, new.y, new.z, new.z);
         END;
 
-        CREATE TRIGGER IF NOT EXISTS systems_ad AFTER DELETE ON systems BEGIN
+        CREATE TRIGGER systems_ad AFTER DELETE ON systems BEGIN
             DELETE FROM systems_rtree WHERE edsm_id = old.edsm_id;
         END;",
     )?;
