@@ -49,9 +49,15 @@ pub fn configure_connection(conn: &Connection) -> Result<(), DbError> {
 
 pub fn initialize_database(conn: &Connection) -> Result<(), DbError> {
     let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS service_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );",
+    )?;
     let schema_version: i64 =
         conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if schema_version >= 1 {
+    if schema_version >= 2 {
         return Ok(());
     }
 
@@ -99,8 +105,27 @@ pub fn initialize_database(conn: &Connection) -> Result<(), DbError> {
             DELETE FROM systems_rtree WHERE edsm_id = old.edsm_id;
         END;
 
-        PRAGMA user_version = 1;
+        PRAGMA user_version = 2;
         COMMIT;",
+    )?;
+    Ok(())
+}
+
+pub fn get_metadata(conn: &Connection, key: &str) -> Result<Option<String>, DbError> {
+    conn.query_row(
+        "SELECT value FROM service_metadata WHERE key = ?1",
+        [key],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(DbError::from)
+}
+
+pub fn set_metadata(conn: &Connection, key: &str, value: &str) -> Result<(), DbError> {
+    conn.execute(
+        "INSERT INTO service_metadata (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
     )?;
     Ok(())
 }
@@ -172,6 +197,17 @@ mod tests {
             z: 0.0,
             updated_at: None,
         }
+    }
+
+    #[test]
+    fn metadata_is_persisted_and_updated() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_database(&conn).unwrap();
+        assert_eq!(get_metadata(&conn, "last_update").unwrap(), None);
+        set_metadata(&conn, "last_update", "12345").unwrap();
+        assert_eq!(get_metadata(&conn, "last_update").unwrap().as_deref(), Some("12345"));
+        set_metadata(&conn, "last_update", "67890").unwrap();
+        assert_eq!(get_metadata(&conn, "last_update").unwrap().as_deref(), Some("67890"));
     }
 
     #[test]
