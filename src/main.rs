@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use edsm_system_search::api::{AppState, router};
 use edsm_system_search::db::{initialize_database, open_database};
 use edsm_system_search::importer::import_gzip_file;
+use edsm_system_search::updater::{spawn_refresh_loop, synchronize_on_startup};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -66,9 +67,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !max_radius.is_finite() || max_radius <= 0.0 {
                 return Err("EDSM_MAX_RADIUS must be a finite positive number".into());
             }
-            let conn = open_database(&db)?;
-            initialize_database(&conn)?;
-            drop(conn);
+            let db_for_sync = db.clone();
+            let next_refresh = tokio::task::spawn_blocking(move || {
+                synchronize_on_startup(db_for_sync)
+            })
+            .await??;
+            spawn_refresh_loop(db.clone(), next_refresh);
 
             let listener = tokio::net::TcpListener::bind(bind).await?;
             tracing::info!(%bind, %max_radius, "HTTP server listening");
