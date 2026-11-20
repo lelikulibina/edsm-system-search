@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::Client;
@@ -14,6 +15,8 @@ pub const WEEKLY_DUMP_URL: &str =
     "https://www.edsm.net/dump/systemsWithCoordinates7days.json.gz";
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const IMPORT_BATCH_SIZE: usize = 1000;
+const MAX_DOWNLOAD_ATTEMPTS: u32 = 5;
+const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(30);
 const FULL_IMPORT_KEY: &str = "full_import_completed_at";
 const INCREMENTAL_IMPORT_KEY: &str = "last_incremental_import_at";
 
@@ -84,8 +87,52 @@ fn import_from_url(
         .timeout(Duration::from_secs(12 * 60 * 60))
         .user_agent(concat!("edsm-system-search/", env!("CARGO_PKG_VERSION")))
         .build()?;
+
+    let mut delay = INITIAL_RETRY_DELAY;
+    for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
+        match download_and_import(&client, conn, url) {
+            Ok(stats) => return Ok(stats),
+            Err(error) if is_retryable(&error) && attempt < MAX_DOWNLOAD_ATTEMPTS => {
+                warn!(
+                    %error,
+                    attempt,
+                    max_attempts = MAX_DOWNLOAD_ATTEMPTS,
+                    retry_in_seconds = delay.as_secs(),
+                    "EDSM dump stream failed; restarting the download from the beginning"
+                );
+                thread::sleep(delay);
+                delay = delay.saturating_mul(2).min(Duration::from_secs(10 * 60));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("the download retry loop always returns")
+}
+
+fn download_and_import(
+    client: &Client,
+    conn: &Connection,
+    url: &str,
+) -> Result<crate::importer::ImportStats, UpdateError> {
     let response = client.get(url).send()?.error_for_status()?;
     Ok(import_gzip_reader(response, conn, IMPORT_BATCH_SIZE)?)
+}
+
+fn is_retryable(error: &UpdateError) -> bool {
+    match error {
+        UpdateError::Download(error) => {
+            error.is_timeout()
+                || error.is_connect()
+                || error.is_body()
+                || error.status().is_some_and(|status| {
+                    status.as_u16() == 429 || status.is_server_error()
+                })
+        }
+        UpdateError::Import(ImportError::Io(_)) => true,
+        UpdateError::Import(ImportError::Json(error)) => error.is_io(),
+        UpdateError::Database(_) | UpdateError::Import(_) => false,
+    }
 }
 
 pub fn spawn_refresh_loop(db_path: PathBuf, initial_delay: Duration) {
