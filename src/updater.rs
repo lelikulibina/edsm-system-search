@@ -25,8 +25,6 @@ pub enum UpdateError {
     Import(#[from] ImportError),
     #[error("download error: {0}")]
     Download(#[from] reqwest::Error),
-    #[error("invalid synchronization timestamp in database")]
-    InvalidTimestamp,
 }
 
 pub fn synchronize_on_startup(db_path: impl AsRef<Path>) -> Result<Duration, UpdateError> {
@@ -37,8 +35,8 @@ pub fn synchronize_on_startup(db_path: impl AsRef<Path>) -> Result<Duration, Upd
         info!("first startup: downloading the complete EDSM systems dump");
         let stats = import_from_url(&conn, FULL_DUMP_URL)?;
         let now = unix_timestamp();
-        set_metadata(&conn, FULL_IMPORT_KEY, &now.to_string())?;
         set_metadata(&conn, INCREMENTAL_IMPORT_KEY, &now.to_string())?;
+        set_metadata(&conn, FULL_IMPORT_KEY, &now.to_string())?;
         info!(
             records_seen = stats.records_seen,
             imported = stats.imported,
@@ -49,9 +47,8 @@ pub fn synchronize_on_startup(db_path: impl AsRef<Path>) -> Result<Duration, Upd
     }
 
     let last_update = get_metadata(&conn, INCREMENTAL_IMPORT_KEY)?
-        .ok_or(UpdateError::InvalidTimestamp)?
-        .parse::<u64>()
-        .map_err(|_| UpdateError::InvalidTimestamp)?;
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
     let now = unix_timestamp();
 
     if is_refresh_due(last_update, now, REFRESH_INTERVAL) {
