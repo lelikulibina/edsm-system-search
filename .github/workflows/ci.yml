@@ -21,3 +21,97 @@ jobs:
       - run: cargo fmt --all
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets
+
+  full-import:
+    # Run only on an explicitly marked push to avoid downloading the multi-GB
+    # EDSM catalogue on every routine CI run.
+    if: github.event_name == 'push' && contains(github.event.head_commit.message, '[full-import-test]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release
+      - name: Start service and wait for the full EDSM import
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          start_time=$(date +%s)
+          ./target/release/edsm-system-search serve --db data/systems.db --bind 127.0.0.1:18080 > service.log 2>&1 &
+          service_pid=$!
+          echo "$service_pid" > service.pid
+
+          cleanup() {
+            if kill -0 "$service_pid" 2>/dev/null; then
+              kill "$service_pid" || true
+              wait "$service_pid" || true
+            fi
+          }
+          trap cleanup EXIT
+
+          deadline=$((SECONDS + 14400))
+          until curl --fail --silent http://127.0.0.1:18080/health >/dev/null; do
+            if ! kill -0 "$service_pid" 2>/dev/null; then
+              cat service.log
+              echo "Service exited before the full import completed" >&2
+              exit 1
+            fi
+            if (( SECONDS >= deadline )); then
+              cat service.log
+              echo "Timed out waiting for the full EDSM import" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+
+          elapsed=$(( $(date +%s) - start_time ))
+          echo "FULL_IMPORT_SECONDS=$elapsed" >> "$GITHUB_ENV"
+          echo "Full import completed in $elapsed seconds"
+      - name: Verify imported catalogue and perform real API searches
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import sqlite3
+          import urllib.parse
+          import urllib.request
+
+          db = sqlite3.connect("data/systems.db")
+          count = db.execute("SELECT count(*) FROM systems").fetchone()[0]
+          assert count > 100_000, f"Unexpectedly small EDSM catalogue: {count} systems"
+          sol = db.execute(
+              "SELECT name, x, y, z FROM systems WHERE name_norm = 'sol' ORDER BY edsm_id LIMIT 1"
+          ).fetchone()
+          assert sol is not None, "Sol is missing from the imported catalogue"
+          assert tuple(sol[1:]) == (0.0, 0.0, 0.0), f"Unexpected Sol coordinates: {sol}"
+
+          def search(center, radius):
+              query = urllib.parse.urlencode({"center": center, "radius": radius})
+              with urllib.request.urlopen(f"http://127.0.0.1:18080/search?{query}", timeout=60) as response:
+                  return json.load(response)
+
+          exact = search("Sol", 100)
+          assert exact["center"]["name"] == "Sol", exact
+          assert exact["count"] > 0, "Spatial search around Sol returned no systems"
+          assert any(item["name"] == "Sol" for item in exact["systems"]), "Sol is absent from its own search results"
+
+          fallback = search("Sol A", 100)
+          assert fallback["center"]["name"] == "Sol", fallback
+
+          size = os.path.getsize("data/systems.db")
+          print(f"Imported systems: {count}")
+          print(f"SQLite database size: {size} bytes ({size / 1024**3:.2f} GiB)")
+          print(f"Exact search around Sol: {exact['count']} systems")
+          print(f"Name fallback 'Sol A' resolved to: {fallback['center']['name']}")
+          print(f"Full import duration: {os.environ.get('FULL_IMPORT_SECONDS', 'see previous step')} seconds")
+          PY
+      - name: Print service log
+        if: always()
+        run: |
+          if [ -f service.log ]; then
+            tail -n 200 service.log
+          fi
