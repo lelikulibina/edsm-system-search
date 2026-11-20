@@ -1,4 +1,123 @@
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use reqwest::blocking::Client;
+use rusqlite::Connection;
+use thiserror::Error;
+use tracing::{info, warn};
+
+use crate::db::{DbError, get_metadata, initialize_database, open_database, set_metadata};
+use crate::importer::{ImportError, import_gzip_reader};
+
+pub const FULL_DUMP_URL: &str = "https://www.edsm.net/dump/systemsWithCoordinates.json.gz";
+pub const WEEKLY_DUMP_URL: &str =
+    "https://www.edsm.net/dump/systemsWithCoordinates7days.json.gz";
+pub const REFRESH_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const IMPORT_BATCH_SIZE: usize = 1000;
+const FULL_IMPORT_KEY: &str = "full_import_completed_at";
+const INCREMENTAL_IMPORT_KEY: &str = "last_incremental_import_at";
+
+#[derive(Debug, Error)]
+pub enum UpdateError {
+    #[error("database error: {0}")]
+    Database(#[from] DbError),
+    #[error("import error: {0}")]
+    Import(#[from] ImportError),
+    #[error("download error: {0}")]
+    Download(#[from] reqwest::Error),
+    #[error("invalid synchronization timestamp in database")]
+    InvalidTimestamp,
+}
+
+pub fn synchronize_on_startup(db_path: impl AsRef<Path>) -> Result<Duration, UpdateError> {
+    let conn = open_database(db_path)?;
+    initialize_database(&conn)?;
+
+    if get_metadata(&conn, FULL_IMPORT_KEY)?.is_none() {
+        info!("first startup: downloading the complete EDSM systems dump");
+        let stats = import_from_url(&conn, FULL_DUMP_URL)?;
+        let now = unix_timestamp();
+        set_metadata(&conn, FULL_IMPORT_KEY, &now.to_string())?;
+        set_metadata(&conn, INCREMENTAL_IMPORT_KEY, &now.to_string())?;
+        info!(
+            records_seen = stats.records_seen,
+            imported = stats.imported,
+            skipped = stats.skipped,
+            "initial EDSM import completed"
+        );
+        return Ok(REFRESH_INTERVAL);
+    }
+
+    let last_update = get_metadata(&conn, INCREMENTAL_IMPORT_KEY)?
+        .ok_or(UpdateError::InvalidTimestamp)?
+        .parse::<u64>()
+        .map_err(|_| UpdateError::InvalidTimestamp)?;
+    let now = unix_timestamp();
+
+    if is_refresh_due(last_update, now, REFRESH_INTERVAL) {
+        info!("seven-day EDSM refresh is due");
+        let stats = import_from_url(&conn, WEEKLY_DUMP_URL)?;
+        set_metadata(&conn, INCREMENTAL_IMPORT_KEY, &now.to_string())?;
+        info!(
+            records_seen = stats.records_seen,
+            imported = stats.imported,
+            skipped = stats.skipped,
+            "incremental EDSM import completed"
+        );
+        Ok(REFRESH_INTERVAL)
+    } else {
+        Ok(remaining_until_refresh(last_update, now, REFRESH_INTERVAL))
+    }
+}
+
+fn import_from_url(
+    conn: &Connection,
+    url: &str,
+) -> Result<crate::importer::ImportStats, UpdateError> {
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(12 * 60 * 60))
+        .user_agent(concat!("edsm-system-search/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let response = client.get(url).send()?.error_for_status()?;
+    Ok(import_gzip_reader(response, conn, IMPORT_BATCH_SIZE)?)
+}
+
+pub fn spawn_refresh_loop(db_path: PathBuf, initial_delay: Duration) {
+    tokio::spawn(async move {
+        let mut delay = initial_delay;
+        loop {
+            tokio::time::sleep(delay).await;
+            let path = db_path.clone();
+            match tokio::task::spawn_blocking(move || synchronize_on_startup(path)).await {
+                Ok(Ok(next_delay)) => delay = next_delay,
+                Ok(Err(error)) => {
+                    warn!(%error, "automatic EDSM refresh failed; will retry in six hours");
+                    delay = Duration::from_secs(6 * 60 * 60);
+                }
+                Err(error) => {
+                    warn!(%error, "automatic EDSM refresh task failed; will retry in six hours");
+                    delay = Duration::from_secs(6 * 60 * 60);
+                }
+            }
+        }
+    });
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn is_refresh_due(last_update: u64, now: u64, interval: Duration) -> bool {
+    now.saturating_sub(last_update) >= interval.as_secs()
+}
+
+fn remaining_until_refresh(last_update: u64, now: u64, interval: Duration) -> Duration {
+    Duration::from_secs(interval.as_secs().saturating_sub(now.saturating_sub(last_update)))
+}
 
 #[cfg(test)]
 mod tests {
@@ -10,5 +129,14 @@ mod tests {
         assert!(!is_refresh_due(1_000, 1_000 + interval.as_secs() - 1, interval));
         assert!(is_refresh_due(1_000, 1_000 + interval.as_secs(), interval));
         assert!(is_refresh_due(1_000, 1_000 + interval.as_secs() + 1, interval));
+    }
+
+    #[test]
+    fn clock_going_backwards_does_not_make_refresh_due() {
+        assert!(!is_refresh_due(2_000, 1_000, REFRESH_INTERVAL));
+        assert_eq!(
+            remaining_until_refresh(2_000, 1_000, REFRESH_INTERVAL),
+            REFRESH_INTERVAL
+        );
     }
 }
