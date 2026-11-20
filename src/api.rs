@@ -1,35 +1,34 @@
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
-use rusqlite::Connection;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Arc;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use tokio::sync::Semaphore;
-use tokio::task;
 use tower_http::trace::TraceLayer;
 
-use crate::db::open_database;
-use crate::search::{SearchError, search_radius};
+use crate::service::{SearchLimits, SearchService, SearchServiceError};
+use crate::spansh::{SpanshClient, SpanshError};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub database_path: PathBuf,
-    pub max_radius: f64,
-    db_slots: Arc<Semaphore>,
+    service: Arc<SearchService>,
+    slots: Arc<Semaphore>,
 }
 
 impl AppState {
-    pub fn new(database_path: PathBuf, max_radius: f64) -> Self {
+    pub fn new(service: SearchService) -> Self {
         Self {
-            database_path,
-            max_radius,
-            db_slots: Arc::new(Semaphore::new(8)),
+            service: Arc::new(service),
+            slots: Arc::new(Semaphore::new(2)),
         }
+    }
+
+    pub fn from_spansh(client: SpanshClient, limits: SearchLimits) -> Self {
+        Self::new(SearchService::new(client, limits))
     }
 }
 
@@ -39,9 +38,16 @@ pub struct SearchQuery {
     pub radius: f64,
 }
 
-#[derive(Debug, Serialize)]
-struct HealthResponse {
-    status: &'static str,
+#[derive(Debug, Deserialize)]
+pub struct SearchRequest {
+    pub center: String,
+    pub radius: f64,
+    #[serde(default = "empty_filters")]
+    pub filters: Value,
+}
+
+fn empty_filters() -> Value {
+    json!({})
 }
 
 #[derive(Debug)]
@@ -62,23 +68,28 @@ impl IntoResponse for ApiError {
     }
 }
 
-impl From<SearchError> for ApiError {
-    fn from(error: SearchError) -> Self {
+impl From<SearchServiceError> for ApiError {
+    fn from(error: SearchServiceError) -> Self {
         match error {
-            SearchError::CenterNotFound => Self {
+            SearchServiceError::InvalidCenter => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_center",
+                message: error.to_string(),
+            },
+            SearchServiceError::InvalidRadius => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_radius",
+                message: error.to_string(),
+            },
+            SearchServiceError::Spansh(SpanshError::SystemNotFound(_)) => Self {
                 status: StatusCode::NOT_FOUND,
                 code: "center_not_found",
                 message: error.to_string(),
             },
-            SearchError::InvalidRadius => Self {
-                status: StatusCode::BAD_REQUEST,
-                code: "invalid_request",
+            SearchServiceError::Spansh(_) => Self {
+                status: StatusCode::BAD_GATEWAY,
+                code: "spansh_upstream_error",
                 message: error.to_string(),
-            },
-            other => Self {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                code: "database_error",
-                message: other.to_string(),
             },
         }
     }
@@ -87,125 +98,70 @@ impl From<SearchError> for ApiError {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/search", get(search))
+        .route("/search", get(search_get).post(search_post))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
 
-async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
-    let permit = state.db_slots.clone().acquire_owned().await.map_err(|e| ApiError {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        code: "database_unavailable",
-        message: e.to_string(),
-    })?;
-    let path = state.database_path;
-    task::spawn_blocking(move || -> Result<(), String> {
-        let _permit = permit;
-        let conn = open_database(path).map_err(|e| e.to_string())?;
-        let _: i64 = conn.query_row("SELECT count(*) FROM systems", [], |row| row.get(0)).map_err(|e| e.to_string())?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: "database_error",
-        message: e.to_string(),
-    })?
-    .map_err(|message| ApiError {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        code: "database_unavailable",
-        message,
-    })?;
-
-    Ok(Json(HealthResponse { status: "ok" }))
+async fn health() -> Json<Value> {
+    Json(json!({"status":"ok","upstream":"spansh"}))
 }
 
-async fn search(
+async fn search_get(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
-) -> Result<Json<crate::search::SearchResponse>, ApiError> {
-    if query.center.trim().is_empty()
-        || !query.radius.is_finite()
-        || query.radius <= 0.0
-        || query.radius > state.max_radius
-    {
+) -> Result<Json<crate::service::BodySearchResult>, ApiError> {
+    execute_search(state, query.center, query.radius, empty_filters()).await
+}
+
+async fn search_post(
+    State(state): State<AppState>,
+    Json(request): Json<SearchRequest>,
+) -> Result<Json<crate::service::BodySearchResult>, ApiError> {
+    if !request.filters.is_object() {
         return Err(ApiError {
             status: StatusCode::BAD_REQUEST,
-            code: "invalid_request",
-            message: format!("center must be non-empty and radius must be in (0, {}]", state.max_radius),
+            code: "invalid_filters",
+            message: "filters must be a JSON object".into(),
         });
     }
+    execute_search(state, request.center, request.radius, request.filters).await
+}
 
-    let permit = state.db_slots.clone().acquire_owned().await.map_err(|e| ApiError {
+async fn execute_search(
+    state: AppState,
+    center: String,
+    radius: f64,
+    filters: Value,
+) -> Result<Json<crate::service::BodySearchResult>, ApiError> {
+    let _permit = state.slots.clone().acquire_owned().await.map_err(|error| ApiError {
         status: StatusCode::SERVICE_UNAVAILABLE,
-        code: "database_unavailable",
-        message: e.to_string(),
+        code: "search_capacity_exhausted",
+        message: error.to_string(),
     })?;
-    let path = state.database_path;
-    let center = query.center;
-    let radius = query.radius;
-    let result = task::spawn_blocking(move || {
-        let _permit = permit;
-        let conn: Connection = open_database(path)?;
-        search_radius(&conn, &center, radius)
-    })
-    .await
-    .map_err(|e| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: "database_error",
-        message: e.to_string(),
-    })?
-    .map_err(ApiError::from)?;
-
+    let result = state.service.search_bodies(&center, radius, filters).await.map_err(ApiError::from)?;
     Ok(Json(result))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
-    use http_body_util::BodyExt;
-    use rusqlite::Connection;
-    use tempfile::tempdir;
-    use tower::ServiceExt;
-
-    use crate::db::{System, initialize_database, upsert_system};
 
     #[tokio::test]
-    async fn search_endpoint_returns_json_results() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        let conn = Connection::open(&db_path).unwrap();
-        initialize_database(&conn).unwrap();
-        upsert_system(&conn, &System {
-            edsm_id: 1, id64: None, name: "Sol".into(),
-            x: 0.0, y: 0.0, z: 0.0, updated_at: None,
-        }).unwrap();
-        drop(conn);
-
-        let app = router(AppState::new(db_path, 10.0));
-        let response = app.oneshot(
-            axum::http::Request::builder()
-                .uri("/search?center=Sol&radius=2")
-                .body(Body::empty()).unwrap()
+    async fn health_does_not_depend_on_a_database() {
+        let client = SpanshClient::with_base_url("http://127.0.0.1:9/api").unwrap();
+        let app = router(AppState::from_spansh(client, SearchLimits::default()));
+        let response = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::builder().uri("/health").body(axum::body::Body::empty()).unwrap(),
         ).await.unwrap();
-
         assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["count"], 1);
-        assert_eq!(value["center"]["name"], "Sol");
     }
 
-    #[tokio::test]
-    async fn search_endpoint_rejects_radius_above_limit() {
-        let dir = tempdir().unwrap();
-        let app = router(AppState::new(dir.path().join("missing.db"), 10.0));
-        let response = app.oneshot(
-            axum::http::Request::builder()
-                .uri("/search?center=Sol&radius=11")
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    #[test]
+    fn get_search_query_deserializes_center_and_radius() {
+        let query: SearchQuery = serde_urlencoded::from_str("center=Sol&radius=25").unwrap();
+        assert_eq!(query.center, "Sol");
+        assert_eq!(query.radius, 25.0);
     }
 }
