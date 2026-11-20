@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::spansh::{Body, BodySearchRequest, Coordinates, SpanshClient, SpanshError, StarSystem};
+use crate::spansh::{Body, BodySearchRequest, SpanshClient, SpanshError, StarSystem};
 
 #[derive(Debug, Clone)]
 pub struct SearchLimits {
@@ -104,6 +104,9 @@ impl SearchService {
                 count_capped = response.count >= 10_000;
             }
 
+            let page_len = response.results.len();
+            let page_from = response.from;
+            let page_count = response.count;
             for body in response.results {
                 if bodies.len() >= self.limits.max_results {
                     truncated = true;
@@ -118,8 +121,8 @@ impl SearchService {
                 break;
             }
 
-            let next_offset = response.from.saturating_add(response.results_len() as u64);
-            let has_more = next_offset < response.count;
+            let next_offset = page_from.saturating_add(page_len as u64);
+            let has_more = next_offset < page_count;
             if !has_more {
                 break;
             }
@@ -127,7 +130,7 @@ impl SearchService {
                 truncated = true;
                 break;
             }
-            if response.results_len() == 0 {
+            if page_len == 0 {
                 break;
             }
             page += 1;
@@ -196,15 +199,5 @@ mod tests {
         assert!(limits.max_pages > 0);
         assert!(limits.max_results > 0);
         assert!(limits.max_radius.is_finite());
-    }
-}
-
-trait PageLength {
-    fn results_len(&self) -> usize;
-}
-
-impl<T> PageLength for crate::spansh::SearchPage<T> {
-    fn results_len(&self) -> usize {
-        self.results.len()
     }
 }
