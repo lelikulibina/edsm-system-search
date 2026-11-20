@@ -85,18 +85,15 @@ edsm-system-search serve --db data/systems.db --bind 0.0.0.0:8080 --max-radius 1
 docker build -t edsm-system-search .
 ```
 
-Инициализация и импорт выполняются одноразовыми контейнерами с общим томом:
+При первом запуске API автоматически скачает полный дамп и создаст каталог. Отдельно запускать `init-db` и `import` не требуется:
 
 ```bash
-docker run --rm -v edsm-data:/data edsm-system-search init-db
-docker run --rm -v edsm-data:/data -v "$PWD:/input:ro" edsm-system-search import --file /input/systemsWithCoordinates.json.gz
+docker run -d --name edsm-system-search --restart unless-stopped \
+  -p 8080:8080 -v edsm-data:/data \
+  edsm-system-search serve
 ```
 
-Запуск API:
-
-```bash
-docker run --rm -p 8080:8080 -v edsm-data:/data edsm-system-search serve
-```
+Данные и отметки синхронизации сохраняются в томе `edsm-data`. При последующих запусках полный дамп повторно не скачивается, пока в базе есть отметка об успешном первоначальном импорте.
 
 ## Ограничения и эксплуатация
 
