@@ -1,45 +1,26 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use edsm_system_search::api::{AppState, router};
-use edsm_system_search::db::{initialize_database, open_database};
-use edsm_system_search::importer::import_gzip_file;
-use edsm_system_search::updater::{spawn_refresh_loop, synchronize_on_startup};
+use edsm_system_search::service::SearchLimits;
+use edsm_system_search::spansh::SpanshClient;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "edsm-system-search", version, about = "Search EDSM star systems by name and 3D radius")]
+#[command(name = "edsm-system-search", version, about = "Search Elite Dangerous bodies using the Spansh API")]
 struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Create the SQLite schema and spatial index.
-    InitDb {
-        #[arg(long, env = "EDSM_DB", default_value = "data/systems.db")]
-        db: PathBuf,
-    },
-    /// Import a gzip-compressed EDSM JSON dump.
-    Import {
-        #[arg(long, env = "EDSM_DB", default_value = "data/systems.db")]
-        db: PathBuf,
-        #[arg(long)]
-        file: PathBuf,
-        #[arg(long, default_value_t = 1000)]
-        batch_size: usize,
-    },
-    /// Start the HTTP API.
-    Serve {
-        #[arg(long, env = "EDSM_DB", default_value = "data/systems.db")]
-        db: PathBuf,
-        #[arg(long, env = "EDSM_BIND", default_value = "0.0.0.0:8080")]
-        bind: SocketAddr,
-        #[arg(long, env = "EDSM_MAX_RADIUS", default_value_t = 10_000.0)]
-        max_radius: f64,
-    },
+    #[arg(long, env = "EDSM_BIND", default_value = "0.0.0.0:8080")]
+    bind: SocketAddr,
+    #[arg(long, env = "EDSM_MAX_RADIUS", default_value_t = 500.0)]
+    max_radius: f64,
+    #[arg(long, env = "EDSM_PAGE_SIZE", default_value_t = 100)]
+    page_size: u32,
+    #[arg(long, env = "EDSM_MAX_PAGES", default_value_t = 20)]
+    max_pages: u32,
+    #[arg(long, env = "EDSM_MAX_RESULTS", default_value_t = 2_000)]
+    max_results: usize,
+    #[arg(long, env = "SPANSH_API_BASE_URL", default_value = "https://spansh.co.uk/api")]
+    spansh_api_base_url: String,
 }
 
 #[tokio::main]
@@ -48,39 +29,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
-    match Cli::parse().command {
-        Command::InitDb { db } => {
-            let conn = open_database(db)?;
-            initialize_database(&conn)?;
-            tracing::info!("database schema initialized");
-        }
-        Command::Import { db, file, batch_size } => {
-            let conn = open_database(db)?;
-            initialize_database(&conn)?;
-            let stats = import_gzip_file(file, &conn, batch_size)?;
-            println!(
-                "records_seen={} imported={} skipped={}",
-                stats.records_seen, stats.imported, stats.skipped
-            );
-        }
-        Command::Serve { db, bind, max_radius } => {
-            if !max_radius.is_finite() || max_radius <= 0.0 {
-                return Err("EDSM_MAX_RADIUS must be a finite positive number".into());
-            }
-            let db_for_sync = db.clone();
-            let next_refresh = tokio::task::spawn_blocking(move || {
-                synchronize_on_startup(db_for_sync)
-            })
-            .await??;
-            spawn_refresh_loop(db.clone(), next_refresh);
-
-            let listener = tokio::net::TcpListener::bind(bind).await?;
-            tracing::info!(%bind, %max_radius, "HTTP server listening");
-            axum::serve(listener, router(AppState::new(db, max_radius)))
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
-        }
+    let cli = Cli::parse();
+    if !cli.max_radius.is_finite() || cli.max_radius <= 0.0 {
+        return Err("EDSM_MAX_RADIUS must be a finite positive number".into());
     }
+    if cli.page_size == 0 || cli.max_pages == 0 || cli.max_results == 0 {
+        return Err("page size, max pages and max results must be positive".into());
+    }
+
+    let limits = SearchLimits {
+        max_radius: cli.max_radius,
+        page_size: cli.page_size.min(500),
+        max_pages: cli.max_pages,
+        max_results: cli.max_results,
+    };
+    let client = SpanshClient::with_base_url(cli.spansh_api_base_url)?;
+    let listener = tokio::net::TcpListener::bind(cli.bind).await?;
+    tracing::info!(bind = %cli.bind, max_radius = cli.max_radius, "HTTP server listening");
+    axum::serve(listener, router(AppState::from_spansh(client, limits)))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
 
