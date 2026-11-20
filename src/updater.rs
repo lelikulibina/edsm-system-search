@@ -56,15 +56,23 @@ pub fn synchronize_on_startup(db_path: impl AsRef<Path>) -> Result<Duration, Upd
 
     if is_refresh_due(last_update, now, REFRESH_INTERVAL) {
         info!("seven-day EDSM refresh is due");
-        let stats = import_from_url(&conn, WEEKLY_DUMP_URL)?;
-        set_metadata(&conn, INCREMENTAL_IMPORT_KEY, &now.to_string())?;
-        info!(
-            records_seen = stats.records_seen,
-            imported = stats.imported,
-            skipped = stats.skipped,
-            "incremental EDSM import completed"
-        );
-        Ok(REFRESH_INTERVAL)
+        match import_from_url(&conn, WEEKLY_DUMP_URL) {
+            Ok(stats) => {
+                let completed_at = unix_timestamp();
+                set_metadata(&conn, INCREMENTAL_IMPORT_KEY, &completed_at.to_string())?;
+                info!(
+                    records_seen = stats.records_seen,
+                    imported = stats.imported,
+                    skipped = stats.skipped,
+                    "incremental EDSM import completed"
+                );
+                Ok(REFRESH_INTERVAL)
+            }
+            Err(error) => {
+                warn!(%error, "incremental EDSM import failed; existing database will remain available");
+                Ok(Duration::from_secs(6 * 60 * 60))
+            }
+        }
     } else {
         Ok(remaining_until_refresh(last_update, now, REFRESH_INTERVAL))
     }
