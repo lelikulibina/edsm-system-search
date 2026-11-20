@@ -35,7 +35,15 @@ pub fn import_gzip_file(
     batch_size: usize,
 ) -> Result<ImportStats, ImportError> {
     let file = File::open(path)?;
-    import_json(GzDecoder::new(BufReader::new(file)), conn, batch_size)
+    import_gzip_reader(BufReader::new(file), conn, batch_size)
+}
+
+pub fn import_gzip_reader<R: Read>(
+    reader: R,
+    conn: &Connection,
+    batch_size: usize,
+) -> Result<ImportStats, ImportError> {
+    import_json(GzDecoder::new(reader), conn, batch_size)
 }
 
 pub fn import_json<R: Read>(
